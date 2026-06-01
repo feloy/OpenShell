@@ -213,3 +213,65 @@ pub struct NetworkBinaryDef {
     #[allow(dead_code)]
     pub harness: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Well-known path where a sandbox container image can ship a policy YAML file.
+///
+/// When the gateway provides no policy at sandbox creation time, the sandbox
+/// supervisor probes this path before falling back to the restrictive default.
+pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
+
+/// Legacy path used before the navigator → openshell rename.
+///
+/// Existing community sandbox images still ship their policy at this path.
+/// The sandbox supervisor tries [`CONTAINER_POLICY_PATH`] first, then falls
+/// back to this legacy path for backward compatibility.
+pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
+
+/// Maximum number of filesystem paths (`read_only` + `read_write` combined).
+pub(crate) const MAX_FILESYSTEM_PATHS: usize = 256;
+
+/// Maximum length of any single filesystem path string.
+pub(crate) const MAX_PATH_LENGTH: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/// Normalize a filesystem path by collapsing redundant separators
+/// and removing trailing slashes, without requiring the path to exist on disk.
+///
+/// This is a lexical normalization only — it does NOT resolve symlinks or
+/// check the filesystem.
+pub fn normalize_path(path: &str) -> String {
+    use std::path::Component;
+
+    let p = std::path::Path::new(path);
+    let mut normalized = std::path::PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            #[allow(clippy::path_buf_push_overwrite)]
+            Component::RootDir => normalized.push("/"),
+            Component::CurDir => {} // skip "."
+            Component::ParentDir => {
+                // Keep ".." — validation will catch it separately
+                normalized.push("..");
+            }
+            Component::Normal(c) => normalized.push(c),
+        }
+    }
+    normalized.to_string_lossy().to_string()
+}
+
+/// Truncate a string for safe inclusion in error messages.
+pub(crate) fn truncate_for_display(s: &str) -> String {
+    if s.len() <= 80 {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..77])
+    }
+}
