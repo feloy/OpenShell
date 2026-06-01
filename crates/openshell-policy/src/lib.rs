@@ -386,18 +386,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
     Ok(openshell_policy_schema::load_policy(cli_path)?.map(to_proto))
 }
 
-/// Well-known path where a sandbox container image can ship a policy YAML file.
-///
-/// When the gateway provides no policy at sandbox creation time, the sandbox
-/// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
-
-/// Legacy path used before the navigator → openshell rename.
-///
-/// Existing community sandbox images still ship their policy at this path.
-/// The sandbox supervisor tries [`CONTAINER_POLICY_PATH`] first, then falls
-/// back to this legacy path for backward compatibility.
-pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
+pub use openshell_policy_schema::{CONTAINER_POLICY_PATH, LEGACY_CONTAINER_POLICY_PATH};
 
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
