@@ -4,10 +4,8 @@
 //! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
-//!
-//! The serde types here are the **single canonical representation** of the YAML
-//! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
-//! these types, ensuring round-trip fidelity.
+//! YAML schema types and pure parsing logic live in `openshell-policy-schema`;
+//! this crate adds the proto conversion layer on top.
 
 mod compose;
 mod merge;
