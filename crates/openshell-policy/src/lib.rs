@@ -416,12 +416,22 @@ pub use openshell_policy_schema::PolicyViolation;
 
 /// Validate that a sandbox policy does not contain unsafe content.
 ///
-/// Delegates to [`openshell_policy_schema::validate_policy`] via [`from_proto`].
-/// See that function for the full list of checks performed.
+/// Delegates to [`openshell_policy_schema::validate_policy`] after converting
+/// from proto. The process identity is mapped directly (without collapsing empty
+/// strings to `None`) so that `Some(ProcessPolicy { run_as_user: "", .. })`
+/// is correctly rejected rather than silently accepted.
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
-    openshell_policy_schema::validate_policy(&from_proto(policy))
+    let mut file = from_proto(policy);
+    // `from_proto` collapses `Some(ProcessPolicy { run_as_user: "", run_as_group: "" })`
+    // to `None` to avoid emitting `process: {}` in serialized YAML. For validation
+    // we must preserve explicit proto values — an empty string is not "sandbox".
+    file.process = policy.process.as_ref().map(|p| ProcessDef {
+        run_as_user: p.run_as_user.clone(),
+        run_as_group: p.run_as_group.clone(),
+    });
+    openshell_policy_schema::validate_policy(&file)
 }
 
 /// Normalize a filesystem path by collapsing redundant separators
@@ -723,6 +733,17 @@ network_policies:
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn validate_rejects_empty_run_as_user() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: String::new(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
     }
 
     #[test]

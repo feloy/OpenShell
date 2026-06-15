@@ -332,10 +332,11 @@ impl std::fmt::Display for PolicyViolation {
 
 /// Truncate a string for safe inclusion in error messages.
 pub(crate) fn truncate_for_display(s: &str) -> String {
-    if s.len() <= 80 {
+    if s.chars().count() <= 80 {
         s.to_string()
     } else {
-        format!("{}...", &s[..77])
+        let truncated: String = s.chars().take(77).collect();
+        format!("{truncated}...")
     }
 }
 
@@ -988,6 +989,24 @@ network_policies:
     fn validate_rejects_path_too_long() {
         let mut policy = restrictive_default();
         let long_path = format!("/{}", "a".repeat(5000));
+        policy.filesystem_policy = Some(FilesystemDef {
+            include_workdir: true,
+            read_only: vec![long_path],
+            read_write: vec!["/tmp".into()],
+        });
+        let violations = validate_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overlong_multibyte_path() {
+        let mut policy = restrictive_default();
+        // Each 'é' is 2 bytes; byte-slicing at 77 would panic mid-character.
+        let long_path = format!("/{}", "é".repeat(5000));
         policy.filesystem_policy = Some(FilesystemDef {
             include_workdir: true,
             read_only: vec![long_path],
