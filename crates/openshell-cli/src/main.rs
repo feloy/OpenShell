@@ -777,8 +777,12 @@ enum ProviderCommands {
         offset: u32,
 
         /// Print only provider names, one per line.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
     },
 
     /// List available provider profiles.
@@ -2902,8 +2906,10 @@ async fn main() -> Result<()> {
                     limit,
                     offset,
                     names,
+                    output,
                 } => {
-                    run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                    run::provider_list(endpoint, limit, offset, names, output.as_str(), &tls)
+                        .await?;
                 }
                 ProviderCommands::ListProfiles { output } => {
                     run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
@@ -3875,6 +3881,52 @@ mod tests {
                 })
             })
         ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "json"])
+            .expect("provider list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "yaml"])
+            .expect("provider list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_output_conflicts_with_names() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
+    fn provider_list_names_conflicts_with_output() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "--names", "-o", "yaml"]);
+        assert!(result.is_err(), "--names and -o should conflict");
     }
 
     #[test]
