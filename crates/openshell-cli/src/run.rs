@@ -63,6 +63,7 @@ use openshell_providers::{
     profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -79,6 +80,27 @@ pub use crate::ssh::{
 pub use openshell_core::forward::{
     ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PolicyGetView {
+    Metadata,
+    Base,
+    Full,
+}
+
+impl PolicyGetView {
+    pub fn from_flags(base: bool, full: bool) -> Self {
+        match (base, full) {
+            (true, _) => Self::Base,
+            (false, true) => Self::Full,
+            (false, false) => Self::Metadata,
+        }
+    }
+
+    fn includes_policy(self) -> bool {
+        matches!(self, Self::Base | Self::Full)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum SandboxUploadPlan {
@@ -6919,7 +6941,7 @@ pub async fn sandbox_policy_get(
     server: &str,
     name: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6929,7 +6951,7 @@ pub async fn sandbox_policy_get(
         server,
         name,
         version,
-        full,
+        view,
         output,
         tls,
         (&mut stdout, &mut stderr),
@@ -6953,7 +6975,7 @@ pub async fn sandbox_policy_get_to_writer<W, E>(
     server: &str,
     name: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
     writers: (&mut W, &mut E),
@@ -6963,7 +6985,7 @@ where
     E: Write + Send,
 {
     if version == 0 {
-        return sandbox_policy_get_effective_to_writer(server, name, full, output, tls, writers)
+        return sandbox_policy_get_effective_to_writer(server, name, view, output, tls, writers)
             .await;
     }
 
@@ -6990,7 +7012,7 @@ where
                     Some(inner.active_version),
                     &rev,
                     status,
-                    full,
+                    view,
                 )?;
                 writeln!(
                     stdout,
@@ -7018,10 +7040,11 @@ where
             writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
         }
 
-        if full {
+        if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 writeln!(stdout, "---").into_diagnostic()?;
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
@@ -7039,7 +7062,7 @@ where
 async fn sandbox_policy_get_effective_to_writer<W, E>(
     server: &str,
     name: &str,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
     writers: (&mut W, &mut E),
@@ -7112,10 +7135,11 @@ where
                     serde_json::json!(config.global_policy_version),
                 );
             }
-            if full {
+            if view.includes_policy() {
+                let policy = policy_for_view(policy, view);
                 obj.insert(
                     "policy".to_string(),
-                    openshell_policy::sandbox_policy_to_json_value(policy)?,
+                    openshell_policy::sandbox_policy_to_json_value(policy.as_ref())?,
                 );
             }
             writeln!(
@@ -7135,9 +7159,10 @@ where
                 writeln!(stdout, "Global:       {}", config.global_policy_version)
                     .into_diagnostic()?;
             }
-            if full {
+            if view.includes_policy() {
                 writeln!(stdout, "---").into_diagnostic()?;
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 write!(stdout, "{yaml_str}").into_diagnostic()?;
             }
@@ -7151,7 +7176,7 @@ where
 pub async fn sandbox_policy_get_global(
     server: &str,
     version: u32,
-    full: bool,
+    view: PolicyGetView,
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -7171,7 +7196,7 @@ pub async fn sandbox_policy_get_global(
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
         match output {
             "json" => {
-                let obj = policy_revision_to_json("global", None, None, &rev, status, full)?;
+                let obj = policy_revision_to_json("global", None, None, &rev, status, view)?;
                 println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
                 return Ok(());
             }
@@ -7190,10 +7215,11 @@ pub async fn sandbox_policy_get_global(
             println!("Loaded:       {} ms", rev.loaded_at_ms);
         }
 
-        if full {
+        if view.includes_policy() {
             if let Some(ref policy) = rev.policy {
                 println!("---");
-                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                let policy = policy_for_view(policy, view);
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy.as_ref())
                     .wrap_err("failed to serialize policy to YAML")?;
                 print!("{yaml_str}");
             } else {
@@ -7223,7 +7249,7 @@ fn policy_revision_to_json(
     active_version: Option<u32>,
     rev: &openshell_core::proto::SandboxPolicyRevision,
     status: PolicyStatus,
-    full: bool,
+    view: PolicyGetView,
 ) -> Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     obj.insert("scope".to_string(), serde_json::json!(scope));
@@ -7257,14 +7283,29 @@ fn policy_revision_to_json(
     if !rev.load_error.is_empty() {
         obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
     }
-    if full {
+    if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
-            Some(policy) => openshell_policy::sandbox_policy_to_json_value(policy)?,
+            Some(policy) => {
+                let policy = policy_for_view(policy, view);
+                openshell_policy::sandbox_policy_to_json_value(policy.as_ref())?
+            }
             None => serde_json::Value::Null,
         };
         obj.insert("policy".to_string(), policy);
     }
     Ok(serde_json::Value::Object(obj))
+}
+
+fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, SandboxPolicy> {
+    if view != PolicyGetView::Base {
+        return Cow::Borrowed(policy);
+    }
+
+    let mut base_policy = policy.clone();
+    base_policy
+        .network_policies
+        .retain(|name, _| !openshell_policy::is_provider_rule_name(name));
+    Cow::Owned(base_policy)
 }
 
 pub async fn sandbox_policy_list(
