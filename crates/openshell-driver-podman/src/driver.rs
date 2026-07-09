@@ -185,6 +185,7 @@ impl PodmanComputeDriver {
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
+        config.validate_proxy_config()?;
 
         let client = PodmanClient::new(config.socket_path.clone());
 
