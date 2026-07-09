@@ -12,8 +12,17 @@
 //! approved connections through the corporate proxy with HTTP CONNECT.
 //!
 //! Scope and invariants:
-//! - Only `http://` proxy URLs are supported. `https://` and SOCKS proxies
-//!   are ignored with a warning.
+//! - `http://` and `https://` proxy URLs are supported; SOCKS proxies are
+//!   ignored with a warning. For `https://` proxies the supervisor opens a
+//!   TLS connection to the proxy first and runs the CONNECT handshake inside
+//!   it, verifying the proxy certificate against the built-in and system
+//!   roots plus an optional corporate CA bundle named by the
+//!   `OPENSHELL_PROXY_CA_BUNDLE` environment variable (path to a PEM file).
+//! - The same CA bundle is also folded into the sandbox trust bundle and the
+//!   L7 upstream verification store at startup (see `run.rs`): a
+//!   TLS-intercepting corporate proxy re-signs tunneled server certificates
+//!   with its CA, so trusting it only for the proxy-listener handshake would
+//!   make every intercepted upstream handshake fail.
 //! - Policy evaluation, DNS resolution, and SSRF checks run exactly as in the
 //!   direct-dial path; the corporate proxy only replaces the final TCP dial.
 //! - `NO_PROXY` decides which destinations bypass the corporate proxy and
@@ -22,11 +31,17 @@
 
 use std::io::{Error as IoError, ErrorKind};
 use std::net::IpAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 /// Upper bound on the corporate proxy's CONNECT response header block.
@@ -53,6 +68,10 @@ pub struct ProxyEndpoint {
     /// Pre-computed `Basic <base64>` header value from URL userinfo.
     /// Never logged.
     proxy_authorization: Option<String>,
+    /// TLS client config for `https://` proxies; `None` for plain `http://`.
+    /// The connection to the proxy is wrapped in TLS before the CONNECT
+    /// handshake.
+    tls: Option<Arc<ClientConfig>>,
 }
 
 impl ProxyEndpoint {
@@ -60,6 +79,12 @@ impl ProxyEndpoint {
     #[must_use]
     pub fn display_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// `scheme://host:port` label for startup logging. Excludes credentials.
+    fn display_url(&self) -> String {
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        format!("{scheme}://{}:{}", self.host, self.port)
     }
 }
 
@@ -69,6 +94,7 @@ impl std::fmt::Debug for ProxyEndpoint {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("proxy_authorization", &self.proxy_authorization.is_some())
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -179,12 +205,24 @@ impl UpstreamProxyConfig {
                 .filter(|v| !v.trim().is_empty())
         };
         let all = var("ALL_PROXY", "all_proxy");
+        // TLS client config for `https://` proxy URLs, built at most once and
+        // shared by both endpoints. Root store: built-in Mozilla roots +
+        // system bundle + the optional corporate CA bundle file named by
+        // `OPENSHELL_PROXY_CA_BUNDLE`.
+        let tls_config_cell = std::cell::OnceCell::new();
+        let tls_config = || -> Arc<ClientConfig> {
+            tls_config_cell
+                .get_or_init(|| {
+                    build_proxy_tls_config(proxy_ca_bundle_pem_with(&lookup).as_deref())
+                })
+                .clone()
+        };
         let https = var("HTTPS_PROXY", "https_proxy")
             .or_else(|| all.clone())
-            .and_then(|url| parse_proxy_url(&url, "HTTPS_PROXY"));
+            .and_then(|url| parse_proxy_url(&url, "HTTPS_PROXY", &tls_config));
         let http = var("HTTP_PROXY", "http_proxy")
             .or(all)
-            .and_then(|url| parse_proxy_url(&url, "HTTP_PROXY"));
+            .and_then(|url| parse_proxy_url(&url, "HTTP_PROXY", &tls_config));
         if https.is_none() && http.is_none() {
             return None;
         }
@@ -213,7 +251,7 @@ impl UpstreamProxyConfig {
     #[must_use]
     pub fn summary(&self) -> String {
         let fmt = |ep: Option<&ProxyEndpoint>| {
-            ep.map_or_else(|| "-".to_string(), ProxyEndpoint::display_addr)
+            ep.map_or_else(|| "-".to_string(), ProxyEndpoint::display_url)
         };
         format!(
             "https_proxy={} http_proxy={} no_proxy_entries={}",
@@ -224,22 +262,56 @@ impl UpstreamProxyConfig {
     }
 }
 
-/// Parse an `http://[user:pass@]host[:port]` proxy URL. Unsupported schemes
-/// (TLS or SOCKS proxies) are rejected with a warning.
-fn parse_proxy_url(raw: &str, var_name: &str) -> Option<ProxyEndpoint> {
-    let raw = raw.trim();
-    let rest = match raw.split_once("://") {
-        Some((scheme, rest)) => {
-            if !scheme.eq_ignore_ascii_case("http") {
-                warn!(
-                    "{var_name} uses unsupported proxy scheme '{scheme}' \
-                     (only http:// proxies are supported); ignoring"
-                );
-                return None;
-            }
-            rest
+/// Read the corporate proxy CA bundle PEM named by the
+/// `OPENSHELL_PROXY_CA_BUNDLE` environment variable, if set and readable.
+///
+/// A TLS-intercepting corporate proxy signs both its own listener
+/// certificate and the re-signed certificates of tunneled destinations with
+/// this CA, so callers use the bundle for proxy-listener TLS (`https://`
+/// proxy URLs) and for upstream certificate verification behind the proxy.
+#[must_use]
+pub fn proxy_ca_bundle_pem() -> Option<String> {
+    proxy_ca_bundle_pem_with(&|name| std::env::var(name).ok())
+}
+
+fn proxy_ca_bundle_pem_with(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let ca_var = openshell_core::sandbox_env::PROXY_CA_BUNDLE;
+    let path = lookup(ca_var).map(|path| path.trim().to_string())?;
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(pem) => Some(pem),
+        Err(err) => {
+            warn!(
+                "failed to read {ca_var} '{path}': {err}; \
+                 the corporate proxy CA will not be trusted"
+            );
+            None
         }
-        None => raw,
+    }
+}
+
+/// Parse an `http(s)://[user:pass@]host[:port]` proxy URL. Unsupported
+/// schemes (SOCKS proxies) are rejected with a warning. For `https://`
+/// proxies, `tls_config` supplies the shared TLS client configuration.
+fn parse_proxy_url(
+    raw: &str,
+    var_name: &str,
+    tls_config: &dyn Fn() -> Arc<ClientConfig>,
+) -> Option<ProxyEndpoint> {
+    let raw = raw.trim();
+    let (tls, rest) = match raw.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => (false, rest),
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => (true, rest),
+        Some((scheme, _)) => {
+            warn!(
+                "{var_name} uses unsupported proxy scheme '{scheme}' \
+                 (only http:// and https:// proxies are supported); ignoring"
+            );
+            return None;
+        }
+        None => (false, raw),
     };
     // Drop any path component.
     let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
@@ -247,7 +319,8 @@ fn parse_proxy_url(raw: &str, var_name: &str) -> Option<ProxyEndpoint> {
         Some((userinfo, authority)) => (Some(userinfo), authority),
         None => (None, rest),
     };
-    let Some((host, port)) = split_host_port(authority) else {
+    let default_port = if tls { 443 } else { 80 };
+    let Some((host, port)) = split_host_port(authority, default_port) else {
         warn!("{var_name} has an invalid proxy address '{authority}'; ignoring");
         return None;
     };
@@ -263,11 +336,45 @@ fn parse_proxy_url(raw: &str, var_name: &str) -> Option<ProxyEndpoint> {
         host,
         port,
         proxy_authorization,
+        tls: tls.then(tls_config),
     })
 }
 
-/// Split `host[:port]` (with optional `[v6]` brackets), defaulting to port 80.
-fn split_host_port(authority: &str) -> Option<(String, u16)> {
+/// Build the TLS client config used to connect to an `https://` corporate
+/// proxy: built-in Mozilla roots + system CA bundle + the optional corporate
+/// CA bundle PEM.
+fn build_proxy_tls_config(corporate_ca_pem: Option<&str>) -> Arc<ClientConfig> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let system_bundle = crate::l7::tls::read_system_ca_bundle();
+    crate::l7::tls::load_pem_certs_into_store(&mut root_store, &system_bundle);
+
+    if let Some(pem) = corporate_ca_pem {
+        let (added, ignored) = crate::l7::tls::load_pem_certs_into_store(&mut root_store, pem);
+        if added == 0 {
+            warn!(
+                "OPENSHELL_PROXY_CA_BUNDLE contained no usable certificates; \
+                 verifying the upstream proxy against built-in and system roots only"
+            );
+        } else {
+            debug!(
+                added,
+                ignored, "loaded corporate CA certificates for upstream proxy TLS"
+            );
+        }
+    }
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+/// Split `host[:port]` (with optional `[v6]` brackets), defaulting to
+/// `default_port` (80 for `http://` proxies, 443 for `https://`).
+fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
     if authority.is_empty() {
         return None;
     }
@@ -278,7 +385,7 @@ fn split_host_port(authority: &str) -> Option<(String, u16)> {
         let host = authority[1..v6_end].to_string();
         let port = match authority[v6_end + 1..].strip_prefix(':') {
             Some(port) => port.parse().ok()?,
-            None if authority[v6_end + 1..].is_empty() => 80,
+            None if authority[v6_end + 1..].is_empty() => default_port,
             None => return None,
         };
         return Some((host, port));
@@ -286,7 +393,7 @@ fn split_host_port(authority: &str) -> Option<(String, u16)> {
     match authority.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => Some((host.to_string(), port.parse().ok()?)),
         Some(_) => None, // bare IPv6 without brackets is ambiguous
-        None => Some((authority.to_string(), 80)),
+        None => Some((authority.to_string(), default_port)),
     }
 }
 
@@ -314,10 +421,87 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A connected upstream byte stream: either a plain TCP connection or a
+/// stream tunneled inside a TLS session to an `https://` corporate proxy.
+///
+/// Direct dials and `http://` proxy tunnels are `Plain`; only the transport
+/// differs, so both variants behave as transparent byte pipes.
+#[derive(Debug)]
+pub enum UpstreamStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl From<TcpStream> for UpstreamStream {
+    fn from(stream: TcpStream) -> Self {
+        Self::Plain(stream)
+    }
+}
+
+impl AsyncRead for UpstreamStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for UpstreamStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_write_vectored(),
+            Self::Tls(s) => s.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
 /// Open a tunnel to `host:port` through the corporate proxy with HTTP CONNECT.
 ///
-/// Returns the connected stream once the proxy answers 200; after that the
-/// stream is a transparent byte pipe to the destination.
+/// For `https://` proxies the proxy connection is wrapped in TLS (verifying
+/// the proxy certificate against the configured roots) before the CONNECT
+/// handshake. Returns the connected stream once the proxy answers 200; after
+/// that the stream is a transparent byte pipe to the destination.
 ///
 /// The destination hostname (not a locally resolved IP) is sent in the
 /// CONNECT target so hostname-filtering proxies keep working; local DNS
@@ -326,13 +510,14 @@ fn percent_decode(input: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error when the proxy is unreachable, the handshake times out,
-/// or the proxy answers with a non-200 status.
+/// Returns an error when the proxy is unreachable, TLS verification of the
+/// proxy fails, the handshake times out, or the proxy answers with a non-200
+/// status.
 pub async fn connect_via(
     endpoint: &ProxyEndpoint,
     host: &str,
     port: u16,
-) -> std::io::Result<TcpStream> {
+) -> std::io::Result<UpstreamStream> {
     tokio::time::timeout(
         CONNECT_HANDSHAKE_TIMEOUT,
         connect_via_inner(endpoint, host, port),
@@ -353,9 +538,48 @@ async fn connect_via_inner(
     endpoint: &ProxyEndpoint,
     host: &str,
     port: u16,
-) -> std::io::Result<TcpStream> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+) -> std::io::Result<UpstreamStream> {
+    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    let mut stream = match &endpoint.tls {
+        Some(config) => {
+            let server_name = ServerName::try_from(endpoint.host.clone()).map_err(|err| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "upstream proxy host '{}' is not a valid TLS server name: {err}",
+                        endpoint.host
+                    ),
+                )
+            })?;
+            let connector = TlsConnector::from(Arc::clone(config));
+            let tls = connector.connect(server_name, tcp).await.map_err(|err| {
+                IoError::new(
+                    err.kind(),
+                    format!(
+                        "TLS handshake with upstream proxy {} failed: {err}",
+                        endpoint.display_addr()
+                    ),
+                )
+            })?;
+            UpstreamStream::Tls(Box::new(tls))
+        }
+        None => UpstreamStream::Plain(tcp),
+    };
+    connect_handshake(&mut stream, endpoint, host, port).await?;
+    Ok(stream)
+}
 
+/// Send the CONNECT request and read the proxy's response on an established
+/// (possibly TLS-wrapped) proxy connection.
+async fn connect_handshake<S>(
+    stream: &mut S,
+    endpoint: &ProxyEndpoint,
+    host: &str,
+    port: u16,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let target = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -409,7 +633,7 @@ async fn connect_via_inner(
                 target = %target,
                 "upstream proxy CONNECT tunnel established"
             );
-            Ok(stream)
+            Ok(())
         }
         Some(code) => Err(IoError::other(format!(
             "upstream proxy {} refused CONNECT to {target}: HTTP {code}",
@@ -491,9 +715,81 @@ mod tests {
     }
 
     #[test]
-    fn tls_and_socks_proxies_rejected() {
-        assert!(config_from(&[("HTTPS_PROXY", "https://proxy:443")]).is_none());
+    fn socks_proxies_rejected() {
         assert!(config_from(&[("HTTPS_PROXY", "socks5://proxy:1080")]).is_none());
+    }
+
+    #[test]
+    fn https_proxy_scheme_enables_tls_and_defaults_to_port_443() {
+        let cfg = config_from(&[("HTTPS_PROXY", "https://proxy.corp.com")]).unwrap();
+        let ep = cfg.proxy_for(UpstreamScheme::Https, "example.com").unwrap();
+        assert_eq!(ep.display_addr(), "proxy.corp.com:443");
+        assert!(ep.tls.is_some());
+        assert_eq!(
+            cfg.summary(),
+            "https_proxy=https://proxy.corp.com:443 http_proxy=- no_proxy_entries=0"
+        );
+    }
+
+    #[test]
+    fn http_proxy_scheme_stays_plaintext() {
+        let cfg = config_from(&[("HTTPS_PROXY", "http://proxy.corp.com:8080")]).unwrap();
+        let ep = cfg.proxy_for(UpstreamScheme::Https, "example.com").unwrap();
+        assert!(ep.tls.is_none());
+    }
+
+    #[test]
+    fn mixed_schemes_share_one_tls_config() {
+        let cfg = config_from(&[
+            ("HTTPS_PROXY", "https://proxy.corp.com:3130"),
+            ("HTTP_PROXY", "https://proxy.corp.com:3130"),
+        ])
+        .unwrap();
+        let https = cfg
+            .proxy_for(UpstreamScheme::Https, "example.com")
+            .unwrap()
+            .tls
+            .clone()
+            .unwrap();
+        let http = cfg
+            .proxy_for(UpstreamScheme::Http, "example.com")
+            .unwrap()
+            .tls
+            .clone()
+            .unwrap();
+        assert!(Arc::ptr_eq(&https, &http));
+    }
+
+    #[test]
+    fn unreadable_proxy_ca_bundle_still_yields_config() {
+        let cfg = config_from(&[
+            ("HTTPS_PROXY", "https://proxy.corp.com"),
+            (
+                openshell_core::sandbox_env::PROXY_CA_BUNDLE,
+                "/nonexistent/proxy-ca.pem",
+            ),
+        ])
+        .unwrap();
+        let ep = cfg.proxy_for(UpstreamScheme::Https, "example.com").unwrap();
+        assert!(ep.tls.is_some(), "falls back to built-in and system roots");
+    }
+
+    #[test]
+    fn proxy_ca_bundle_pem_reads_configured_file() {
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), "PEM CONTENTS").unwrap();
+        let path = ca_file.path().to_string_lossy().into_owned();
+        let pem = proxy_ca_bundle_pem_with(&|name| {
+            (name == openshell_core::sandbox_env::PROXY_CA_BUNDLE).then(|| path.clone())
+        });
+        assert_eq!(pem.as_deref(), Some("PEM CONTENTS"));
+    }
+
+    #[test]
+    fn proxy_ca_bundle_pem_absent_or_unreadable_yields_none() {
+        assert!(proxy_ca_bundle_pem_with(&|_| None).is_none());
+        assert!(proxy_ca_bundle_pem_with(&|_| Some("  ".to_string())).is_none());
+        assert!(proxy_ca_bundle_pem_with(&|_| Some("/nonexistent/ca.pem".to_string())).is_none());
     }
 
     #[test]
@@ -618,6 +914,7 @@ mod tests {
             host: addr.ip().to_string(),
             port: addr.port(),
             proxy_authorization: auth.map(str::to_string),
+            tls: None,
         }
     }
 
@@ -663,5 +960,104 @@ mod tests {
         let _ = connect_via(&endpoint, "2001:db8::1", 443).await.unwrap();
         let request = handle.await.unwrap();
         assert!(request.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"));
+    }
+
+    // -- TLS (https://) proxies --
+
+    /// A fake `https://` proxy: TLS server with a self-signed cert for
+    /// 127.0.0.1 that answers CONNECT with 200. Returns the listen address,
+    /// the server task (yielding the received CONNECT request), and the
+    /// server certificate PEM to use as the corporate CA bundle.
+    async fn fake_tls_proxy() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<String>,
+        String,
+    ) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_pem = cert.pem();
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut used = 0;
+            loop {
+                let n = tls.read(&mut buf[used..]).await.unwrap();
+                used += n;
+                if n == 0 || buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..used]).into_owned()
+        });
+        (addr, handle, cert_pem)
+    }
+
+    #[tokio::test]
+    async fn connect_via_https_proxy_with_corporate_ca_bundle() {
+        let (addr, handle, cert_pem) = fake_tls_proxy().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), cert_pem).unwrap();
+
+        let proxy_url = format!("https://{addr}");
+        let ca_path = ca_file.path().to_string_lossy().into_owned();
+        let pairs = [
+            ("HTTPS_PROXY", proxy_url.as_str()),
+            (
+                openshell_core::sandbox_env::PROXY_CA_BUNDLE,
+                ca_path.as_str(),
+            ),
+        ];
+        let cfg = config_from(&pairs).unwrap();
+        let endpoint = cfg
+            .proxy_for(UpstreamScheme::Https, "api.example.com")
+            .unwrap();
+
+        let stream = connect_via(endpoint, "api.example.com", 443).await.unwrap();
+        assert!(matches!(stream, UpstreamStream::Tls(_)));
+        drop(stream);
+        let request = handle.await.unwrap();
+        assert!(request.starts_with("CONNECT api.example.com:443 HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn connect_via_https_proxy_rejects_untrusted_cert() {
+        let (addr, _handle, _cert_pem) = fake_tls_proxy().await;
+
+        // No corporate CA bundle: the self-signed proxy cert must not verify.
+        let proxy_url = format!("https://{addr}");
+        let pairs = [("HTTPS_PROXY", proxy_url.as_str())];
+        let cfg = config_from(&pairs).unwrap();
+        let endpoint = cfg
+            .proxy_for(UpstreamScheme::Https, "api.example.com")
+            .unwrap();
+
+        let err = connect_via(endpoint, "api.example.com", 443)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TLS handshake with upstream proxy"),
+            "{err}"
+        );
     }
 }

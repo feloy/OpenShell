@@ -82,11 +82,20 @@ In proxy-required networks, the supervisor honors `HTTPS_PROXY`/`HTTP_PROXY`/
 `NO_PROXY` from its own environment: after policy and SSRF checks pass, it
 chains the upstream dial through the corporate forward proxy with HTTP CONNECT
 instead of connecting directly. `NO_PROXY` destinations, loopback, and
-host-gateway aliases always dial directly. Only `http://` proxy URLs are
-supported. Local DNS resolution and SSRF validation still run before the
-proxied dial; the CONNECT target sent to the corporate proxy is the requested
-hostname. The workload child's proxy variables are unaffected — they are
-always rewritten to point at the local policy proxy.
+host-gateway aliases always dial directly. `http://` and `https://` proxy URLs
+are supported; for `https://` the supervisor wraps the proxy connection in TLS
+first, verifying the proxy certificate against the built-in and system roots
+plus the optional corporate CA bundle named by `OPENSHELL_PROXY_CA_BUNDLE`
+(drivers with a `proxy_ca_bundle` setting bind-mount the operator's PEM file
+and set this variable). Because TLS-intercepting proxies (mitmproxy, squid
+ssl-bump) re-sign tunneled server certificates with the same corporate CA, the
+bundle is also folded into the sandbox trust bundle and the L7 upstream
+verification store at startup — otherwise every intercepted upstream handshake
+would fail after the tunnel is established. Local DNS resolution and SSRF
+validation still run before the proxied dial; the CONNECT target sent to the
+corporate proxy is the requested hostname. The workload child's proxy
+variables are unaffected — they are always rewritten to point at the local
+policy proxy.
 
 ## Credentials
 

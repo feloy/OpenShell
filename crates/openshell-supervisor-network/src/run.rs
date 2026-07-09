@@ -204,7 +204,18 @@ pub async fn run_networking(
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
                     .unwrap_or_else(|_| "/etc/openshell-tls".to_string());
                 let tls_dir = std::path::Path::new(&tls_dir);
-                let system_ca_bundle = read_system_ca_bundle();
+                let mut system_ca_bundle = read_system_ca_bundle();
+                // A TLS-intercepting corporate proxy (issue #1792) re-signs
+                // tunneled server certificates with the corporate CA, so the
+                // operator-provided bundle must be trusted for upstream
+                // re-encryption and by sandbox processes — not only for the
+                // TLS handshake with the proxy listener itself.
+                if let Some(proxy_ca) = crate::upstream_proxy::proxy_ca_bundle_pem() {
+                    if !system_ca_bundle.is_empty() && !system_ca_bundle.ends_with('\n') {
+                        system_ca_bundle.push('\n');
+                    }
+                    system_ca_bundle.push_str(&proxy_ca);
+                }
                 match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
                     Ok(paths) => {
                         // /etc/openshell-tls is subsumed by the /etc baseline

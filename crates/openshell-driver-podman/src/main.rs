@@ -105,17 +105,25 @@ struct Args {
     podman_tls_key: Option<PathBuf>,
 
     /// Corporate forward proxy URL injected into sandbox containers as
-    /// `HTTPS_PROXY` for the supervisor's upstream dials (http:// only).
+    /// `HTTPS_PROXY` for the supervisor's upstream dials (http:// or
+    /// https://).
     #[arg(long, env = "OPENSHELL_SANDBOX_HTTPS_PROXY")]
     sandbox_https_proxy: Option<String>,
 
-    /// Corporate forward proxy URL injected as `HTTP_PROXY` (http:// only).
+    /// Corporate forward proxy URL injected as `HTTP_PROXY` (http:// or
+    /// https://).
     #[arg(long, env = "OPENSHELL_SANDBOX_HTTP_PROXY")]
     sandbox_http_proxy: Option<String>,
 
     /// Comma-separated `NO_PROXY` list injected alongside the proxy URLs.
     #[arg(long, env = "OPENSHELL_SANDBOX_NO_PROXY")]
     sandbox_no_proxy: Option<String>,
+
+    /// Host path to a PEM CA bundle trusted for the corporate proxy: TLS
+    /// connections to an https:// proxy and server certificates re-signed
+    /// by a TLS-intercepting proxy. Bind-mounted into sandbox containers.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
+    sandbox_proxy_ca_bundle: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -153,6 +161,7 @@ async fn main() -> Result<()> {
         https_proxy: args.sandbox_https_proxy,
         http_proxy: args.sandbox_http_proxy,
         no_proxy: args.sandbox_no_proxy,
+        proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
         ..PodmanComputeConfig::default()
     })
     .await

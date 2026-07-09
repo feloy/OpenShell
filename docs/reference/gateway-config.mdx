@@ -356,13 +356,20 @@ sandbox_pids_limit      = 2048
 health_check_interval_secs = 10
 # Corporate forward proxy for sandbox egress. When set, the in-container
 # supervisor chains policy-approved upstream connections through this proxy
-# with HTTP CONNECT instead of dialing destinations directly. Only http://
-# proxy URLs are supported. NO_PROXY entries (hostnames, domain suffixes,
+# with HTTP CONNECT instead of dialing destinations directly. http:// and
+# https:// proxy URLs are supported; with https:// the supervisor connects
+# to the proxy over TLS. NO_PROXY entries (hostnames, domain suffixes,
 # IPs, CIDRs) are dialed directly. Per-sandbox HTTPS_PROXY/HTTP_PROXY/NO_PROXY
 # environment values take precedence over these defaults.
 # https_proxy = "http://proxy.corp.com:8080"
 # http_proxy  = "http://proxy.corp.com:8080"
 # no_proxy    = "*.svc.cluster.local,10.0.0.0/8"
+# Host path to a PEM bundle of CA certificates trusted for the corporate
+# proxy, in addition to the built-in and system roots: the TLS connection to
+# an https:// proxy, and server certificates re-signed by a TLS-intercepting
+# proxy (mitmproxy, squid ssl-bump). The file is bind-mounted read-only into
+# sandbox containers.
+# proxy_ca_bundle = "/etc/pki/corp/proxy-ca.pem"
 ```
 
 ### MicroVM

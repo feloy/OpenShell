@@ -183,11 +183,14 @@ pub async fn tls_terminate_client(
 /// Connect TLS to an upstream server, verifying against webpki-roots.
 ///
 /// Returns a TLS stream for re-encrypted upstream communication.
-pub async fn tls_connect_upstream(
-    upstream: TcpStream,
+pub async fn tls_connect_upstream<S>(
+    upstream: S,
     hostname: &str,
     client_config: &Arc<ClientConfig>,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let connector = TlsConnector::from(Arc::clone(client_config));
     let server_name = ServerName::try_from(hostname.to_string()).into_diagnostic()?;
     let tls_stream = connector
@@ -266,7 +269,7 @@ pub fn write_ca_files(
 /// Returns `(added, ignored)` counts. Invalid or unparseable certificates
 /// are silently ignored, matching the behavior of
 /// `RootCertStore::add_parsable_certificates`.
-fn load_pem_certs_into_store(
+pub(crate) fn load_pem_certs_into_store(
     root_store: &mut rustls::RootCertStore,
     pem_data: &str,
 ) -> (usize, usize) {

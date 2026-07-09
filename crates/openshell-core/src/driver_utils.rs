@@ -72,6 +72,14 @@ pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 /// Container-side mount path for the per-sandbox JWT token.
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
+/// Container-side mount path for the corporate proxy CA bundle.
+///
+/// Drivers with a `proxy_ca_bundle` operator setting bind-mount the host PEM
+/// file here and point `OPENSHELL_PROXY_CA_BUNDLE` at it so the supervisor
+/// can verify TLS to an `https://` corporate egress proxy and trust server
+/// certificates re-signed by a TLS-intercepting proxy.
+pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
 /// Return the XDG state path for a driver's sandbox JWT token file.
 ///
 /// The resulting path is `$XDG_STATE_HOME/openshell/<driver_subdir>[/<namespace>]/<sandbox_id>/sandbox.jwt`.

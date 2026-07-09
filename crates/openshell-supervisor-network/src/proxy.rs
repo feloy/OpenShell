@@ -7,7 +7,7 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
-use crate::upstream_proxy::{self, UpstreamProxyConfig, UpstreamScheme};
+use crate::upstream_proxy::{self, UpstreamProxyConfig, UpstreamScheme, UpstreamStream};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
@@ -2814,14 +2814,14 @@ async fn dial_upstream(
     host_lc: &str,
     port: u16,
     addrs: &[SocketAddr],
-) -> std::io::Result<TcpStream> {
+) -> std::io::Result<UpstreamStream> {
     if let Some(endpoint) = upstream_proxy
         .as_ref()
         .and_then(|cfg| cfg.proxy_for(scheme, host_lc))
     {
         return upstream_proxy::connect_via(endpoint, host_lc, port).await;
     }
-    TcpStream::connect(addrs).await
+    TcpStream::connect(addrs).await.map(UpstreamStream::from)
 }
 
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
@@ -4396,7 +4396,9 @@ async fn handle_forward_proxy(
     // 6. Connect upstream. Host-gateway aliases always dial directly — the
     //    corporate proxy cannot reach the driver-injected host gateway.
     let dial_result = if is_host_gateway_alias(&host_lc) {
-        TcpStream::connect(addrs.as_slice()).await
+        TcpStream::connect(addrs.as_slice())
+            .await
+            .map(UpstreamStream::from)
     } else {
         dial_upstream(
             &upstream_proxy,

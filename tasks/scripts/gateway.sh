@@ -361,6 +361,9 @@ EOF
     if [[ -n "${OPENSHELL_SANDBOX_NO_PROXY:-}" ]]; then
       printf 'no_proxy = "%s"\n' "${OPENSHELL_SANDBOX_NO_PROXY}" >>"${CONFIG_PATH}"
     fi
+    if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE:-}" ]]; then
+      printf 'proxy_ca_bundle = "%s"\n' "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE}" >>"${CONFIG_PATH}"
+    fi
     ;;
 esac
 

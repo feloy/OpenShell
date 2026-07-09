@@ -61,6 +61,7 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
@@ -402,6 +403,13 @@ fn build_env(
         if let Some(value) = value {
             env.entry(name.into()).or_insert_with(|| value.clone());
         }
+    }
+    // Corporate proxy CA bundle for `https://` proxy URLs: the host PEM file
+    // is bind-mounted at PROXY_CA_MOUNT_PATH (see the mounts block) and the
+    // supervisor verifies TLS to the proxy against it.
+    if config.proxy_ca_bundle.is_some() {
+        env.entry(openshell_core::sandbox_env::PROXY_CA_BUNDLE.into())
+            .or_insert_with(|| PROXY_CA_MOUNT_PATH.to_string());
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
@@ -1080,6 +1088,21 @@ pub fn build_container_spec_with_token_and_gpu_devices(
                     options: ro,
                 });
             }
+            // Corporate proxy CA bundle for `https://` proxy TLS; the
+            // supervisor reads it via OPENSHELL_PROXY_CA_BUNDLE (set in
+            // build_env above).
+            if let Some(path) = &config.proxy_ca_bundle {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: path.display().to_string(),
+                    destination: PROXY_CA_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
             m.extend(user_mounts.mounts);
             m
         },
@@ -1740,6 +1763,53 @@ mod tests {
                 "{key} should be absent without operator proxy config"
             );
         }
+        assert!(!env_map.contains_key(openshell_core::sandbox_env::PROXY_CA_BUNDLE));
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m["destination"] == PROXY_CA_MOUNT_PATH),
+            "proxy CA mount should be absent without operator proxy config"
+        );
+    }
+
+    #[test]
+    fn container_spec_mounts_proxy_ca_bundle_and_sets_env() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.https_proxy = Some("https://proxy.corp.com".to_string());
+        config.proxy_ca_bundle = Some(std::path::PathBuf::from("/etc/pki/corp/proxy-ca.pem"));
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::PROXY_CA_BUNDLE)
+                .and_then(|v| v.as_str()),
+            Some(PROXY_CA_MOUNT_PATH),
+            "OPENSHELL_PROXY_CA_BUNDLE should point at the container mount path"
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let ca_mount = mounts
+            .iter()
+            .find(|m| m["destination"] == PROXY_CA_MOUNT_PATH)
+            .expect("proxy CA bundle should be bind-mounted");
+        assert_eq!(ca_mount["source"], "/etc/pki/corp/proxy-ca.pem");
+        assert_eq!(ca_mount["type"], "bind");
+        assert!(
+            ca_mount["options"]
+                .as_array()
+                .expect("mount options")
+                .iter()
+                .any(|o| o == "ro"),
+            "proxy CA mount should be read-only"
+        );
     }
 
     #[test]

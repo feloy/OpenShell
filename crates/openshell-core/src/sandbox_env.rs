@@ -66,6 +66,15 @@ pub const TLS_CERT: &str = "OPENSHELL_TLS_CERT";
 /// Path to the private key for mTLS communication with the gateway.
 pub const TLS_KEY: &str = "OPENSHELL_TLS_KEY";
 
+/// Path to a PEM bundle of extra CAs trusted for the corporate proxy.
+///
+/// Used for the TLS handshake with an `https://` corporate egress proxy
+/// (`HTTPS_PROXY`/`HTTP_PROXY`) and, because TLS-intercepting proxies
+/// re-sign tunneled server certificates with the same CA, also folded into
+/// the sandbox trust bundle and the supervisor's upstream certificate
+/// verification. Added on top of the built-in and system roots.
+pub const PROXY_CA_BUNDLE: &str = "OPENSHELL_PROXY_CA_BUNDLE";
+
 /// Raw gateway-minted JWT identifying this sandbox. Mutually exclusive with
 /// [`SANDBOX_TOKEN_FILE`] / [`K8S_SA_TOKEN_FILE`]; used only by test harnesses
 /// that bypass the file-mount path.
