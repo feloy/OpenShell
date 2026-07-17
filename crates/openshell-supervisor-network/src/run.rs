@@ -89,6 +89,7 @@ pub async fn run_networking(
     activity_tx: Option<ActivitySender>,
     agent_proposals: AgentProposals,
     workspace_rx: tokio::sync::watch::Receiver<String>,
+    upstream_proxy_args: &crate::upstream_proxy::UpstreamProxyArgs,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -314,6 +315,7 @@ pub async fn run_networking(
             denial_tx,
             activity_tx,
             engine_ready_rx,
+            upstream_proxy_args,
         )
         .await?;
         Some(proxy_handle)
