@@ -344,17 +344,7 @@ impl OpaEngine {
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-        for w in &warnings {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Medium)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.clone()))
-                    .message(format!("L7 policy validation warning: {w}"))
-                    .build()
-            );
-        }
+        emit_l7_config_warnings(&warnings, "L7 policy validation warning");
         if !errors.is_empty() {
             return Err(miette::miette!(
                 "L7 policy validation failed:\n{}",
@@ -365,7 +355,8 @@ impl OpaEngine {
         normalize_l7_policy_rule_aliases(&mut data);
 
         // Expand access presets to explicit rules after validation
-        crate::l7::expand_access_presets(&mut data);
+        let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+        emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
         let mut engine = regorus::Engine::new();
@@ -1032,6 +1023,20 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
+fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
+    for w in warnings {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .unmapped("warning", serde_json::json!(w))
+                .message(format!("{prefix}: {w}"))
+                .build()
+        );
+    }
+}
+
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
 fn preprocess_yaml_data(
     yaml_str: &str,
@@ -1073,17 +1078,7 @@ fn preprocess_yaml_data(
     }
 
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-    for w in &warnings {
-        openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.clone()))
-                .message(format!("L7 policy validation warning: {w}"))
-                .build()
-        );
-    }
+    emit_l7_config_warnings(&warnings, "L7 policy validation warning");
     if !errors.is_empty() {
         return Err(miette::miette!(
             "L7 policy validation failed:\n{}",
@@ -1094,7 +1089,8 @@ fn preprocess_yaml_data(
     normalize_l7_policy_rule_aliases(&mut data);
 
     // Expand access presets to explicit rules after validation
-    crate::l7::expand_access_presets(&mut data);
+    let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+    emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
 }
