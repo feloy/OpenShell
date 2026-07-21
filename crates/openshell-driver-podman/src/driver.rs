@@ -19,7 +19,7 @@ use openshell_core::gpu::{
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -157,22 +157,48 @@ fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
 
+/// Resolve the socket to connect to: explicit configuration wins, otherwise
+/// fall back to `detect`. Returns an error if neither resolves.
+///
+/// Takes `detect` as a parameter (rather than calling
+/// [`openshell_core::config::detect_podman_socket`] directly) so tests can
+/// exercise the precedence deterministically, without touching real
+/// environment variables or the filesystem.
+fn resolve_socket_path(
+    configured: Option<PathBuf>,
+    detect: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, PodmanApiError> {
+    configured.or_else(detect).ok_or_else(|| {
+        PodmanApiError::InvalidInput(
+            "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET \
+             or configure socket_path"
+                .to_string(),
+        )
+    })
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        if !config.socket_path.exists() {
+        let socket_path = resolve_socket_path(
+            config.socket_path.clone(),
+            openshell_core::config::detect_podman_socket,
+        )?;
+        config.socket_path = Some(socket_path.clone());
+
+        if !socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is podman machine running? \
                      Try `podman machine start` or set OPENSHELL_PODMAN_SOCKET to override."
                 );
             } else {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is the Podman service running? \
                      Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
                 );
@@ -186,7 +212,7 @@ impl PodmanComputeDriver {
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
 
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(socket_path);
 
         // Verify connectivity, retrying briefly to tolerate transient socket
         // unavailability (e.g. podman.socket restarting after a package
@@ -773,7 +799,7 @@ impl PodmanComputeDriver {
         gpu_inventory: CdiGpuInventory,
         allow_all_default_gpu: bool,
     ) -> Self {
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(config.socket_path.clone().unwrap_or_default());
         let refresh_inventory = gpu_inventory.clone();
         Self {
             client,
@@ -848,6 +874,36 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── socket resolution ───────────────────────────────────────────────
+    //
+    // These test resolve_socket_path directly with an injected detector, so
+    // they are deterministic regardless of the host's real environment
+    // variables or whether a Podman socket happens to be running.
+
+    #[test]
+    fn resolve_socket_path_prefers_explicit_configuration() {
+        let path = resolve_socket_path(Some(PathBuf::from("/explicit.sock")), || {
+            Some(PathBuf::from("/detected.sock"))
+        })
+        .unwrap();
+
+        assert_eq!(path, PathBuf::from("/explicit.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_uses_detected_socket_when_unconfigured() {
+        let path = resolve_socket_path(None, || Some(PathBuf::from("/detected.sock"))).unwrap();
+
+        assert_eq!(path, PathBuf::from("/detected.sock"));
+    }
+
+    #[test]
+    fn resolve_socket_path_errors_when_neither_source_resolves() {
+        let err = resolve_socket_path(None, || None).unwrap_err();
+
+        assert!(err.to_string().contains("no responsive Podman API socket"));
+    }
 
     fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
         prost_types::Struct {
@@ -1244,7 +1300,7 @@ mod tests {
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };
@@ -1424,7 +1480,7 @@ mod tests {
             )],
         );
         let config = PodmanComputeConfig {
-            socket_path: socket_path.clone(),
+            socket_path: Some(socket_path.clone()),
             enable_bind_mounts: true,
             ..PodmanComputeConfig::default()
         };
