@@ -1647,6 +1647,11 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     };
     let credentials = form.discovered_credentials.clone().unwrap_or_default();
     let workspace = app.current_workspace.clone();
+    let config: HashMap<String, String> = form
+        .config
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     tokio::spawn(async move {
         // Try with the chosen name, retry with suffix on collision.
@@ -1671,7 +1676,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
-                    config: HashMap::default(),
+                    config: config.clone(),
                     credential_expires_at_ms: HashMap::default(),
                     profile_workspace: workspace.clone(),
                 }),
@@ -1751,10 +1756,24 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let cred_key = form.credential_key.clone();
     let new_value = form.new_value.clone();
     let workspace = app.selected_provider_workspace();
+    let mut config: HashMap<String, String> = form
+        .config
+        .iter()
+        .filter(|(k, v)| form.original_config.get(*k) != Some(*v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    form.original_config
+        .keys()
+        .filter(|k| !form.config.contains_key(*k))
+        .for_each(|key| {
+            config.insert(key.clone(), String::new());
+        });
 
     tokio::spawn(async move {
         let mut credentials = HashMap::new();
-        credentials.insert(cred_key, new_value);
+        if !new_value.is_empty() {
+            credentials.insert(cred_key, new_value);
+        }
 
         let req = openshell_core::proto::UpdateProviderRequest {
             provider: Some(openshell_core::proto::Provider {
@@ -1770,7 +1789,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 }),
                 r#type: ptype,
                 credentials,
-                config: HashMap::default(),
+                config,
                 credential_expires_at_ms: HashMap::default(),
                 profile_workspace: String::new(),
             }),
@@ -2059,20 +2078,16 @@ async fn refresh_providers(app: &mut App) {
         };
 
     app.provider_count = providers.len();
-    app.provider_entries = if app.providers_v2_enabled {
-        providers
-            .iter()
-            .cloned()
-            .map(|provider| app::ProviderV2Entry {
-                profile: profiles
-                    .get(&(provider.profile_workspace.clone(), provider.r#type.clone()))
-                    .cloned(),
-                provider,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    app.provider_entries = providers
+        .iter()
+        .cloned()
+        .map(|provider| app::ProviderListEntry {
+            profile: profiles
+                .get(&(provider.profile_workspace.clone(), provider.r#type.clone()))
+                .cloned(),
+            provider,
+        })
+        .collect();
     app.provider_names = providers
         .iter()
         .map(|p| app::provider_name(p).to_string())
