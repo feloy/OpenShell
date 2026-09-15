@@ -1275,7 +1275,7 @@ async fn provider_update_preserves_stored_type_and_profile_workspace_when_readab
     run::provider_create(
         &ts.endpoint,
         "my-claude",
-        "claude",
+        "claude-code",
         false,
         &["API_KEY=abc".to_string()],
         false,
@@ -1376,7 +1376,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_create(
         &ts.endpoint,
         "my-claude",
-        "claude",
+        "claude-code",
         false,
         &["API_KEY=abc".to_string()],
         false,
@@ -2719,7 +2719,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
     let err = run::provider_create(
         &ts.endpoint,
         "bad-provider",
-        "claude",
+        "claude-code",
         false,
         &["INVALID_PAIR".to_string()],
         false,
@@ -2833,7 +2833,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
     let err = run::provider_create(
         &ts.endpoint,
         "bad-provider",
-        "claude",
+        "claude-code",
         true,
         &["API_KEY=abc".to_string()],
         false,

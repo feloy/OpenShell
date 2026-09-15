@@ -1941,14 +1941,12 @@ fn inject_provider_plugin_environment(
     registry: &openshell_providers::ProviderRegistry,
     environment: &mut HashMap<String, String>,
 ) {
+    // A plugin activates only for a profile the gateway actually resolved. With
+    // no profile there is nothing to project.
     if let Some(profile) =
         get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     {
         registry.inject_env_for_profile_id(provider, &profile.id, environment);
-    } else {
-        // Preserve config projection for legacy records when their profile
-        // source is temporarily unavailable.
-        registry.inject_env(provider, environment);
     }
 }
 
@@ -2271,7 +2269,7 @@ fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) 
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    normalize_provider_type(&provider.r#type) == Some("google-vertex-ai")
+    normalize_profile_id(&provider.r#type).as_deref() == Some("google-vertex-ai")
         && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
@@ -2320,8 +2318,8 @@ use openshell_core::spiffe::{
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
-    normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
-    strategy_primary_env_key, validate_profile_set,
+    normalize_profile_id, strategy_output_env_key, strategy_output_spec, strategy_primary_env_key,
+    validate_profile_set,
 };
 use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
@@ -3532,15 +3530,8 @@ async fn profile_attached_sandbox_diagnostics(
             else {
                 continue;
             };
-            let requested_profile_id = normalize_profile_id(&provider.r#type)
+            let profile_id = normalize_profile_id(&provider.r#type)
                 .unwrap_or_else(|| provider.r#type.trim().to_string());
-            let profile_id = if candidate_profiles.contains_key(&requested_profile_id) {
-                requested_profile_id
-            } else {
-                normalize_provider_type(&provider.r#type)
-                    .filter(|alias| candidate_profiles.contains_key(*alias))
-                    .map_or(requested_profile_id, str::to_string)
-            };
             let scope_mismatch = (is_platform_scope && !provider.profile_workspace.is_empty())
                 || (!is_platform_scope && provider.profile_workspace.is_empty());
             if scope_mismatch {
@@ -4966,19 +4957,20 @@ async fn provider_profile_for_name(
         .map(|provider| telemetry_provider_profile(&provider.r#type))
 }
 
+/// Bucket a provider type for telemetry.
+///
+/// Matches the profile ID exactly. Any ID without a bucket, including every
+/// operator-authored profile, reports as `Custom`.
 fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
-    match normalize_provider_type(provider_type) {
+    match normalize_profile_id(provider_type).as_deref() {
         Some("anthropic") => TelemetryProviderProfile::Anthropic,
-        Some("claude" | "claude-code") => TelemetryProviderProfile::Claude,
+        Some("claude-code") => TelemetryProviderProfile::Claude,
         Some("codex") => TelemetryProviderProfile::Codex,
         Some("copilot") => TelemetryProviderProfile::Copilot,
         Some("deepinfra") => TelemetryProviderProfile::Deepinfra,
         Some("github") => TelemetryProviderProfile::Github,
-        Some("gitlab") => TelemetryProviderProfile::Gitlab,
         Some("nvidia") => TelemetryProviderProfile::Nvidia,
         Some("openai") => TelemetryProviderProfile::Openai,
-        Some("opencode") => TelemetryProviderProfile::Opencode,
-        Some("outlook") => TelemetryProviderProfile::Outlook,
         _ => TelemetryProviderProfile::Custom,
     }
 }
@@ -5083,19 +5075,33 @@ mod tests {
     #[test]
     fn telemetry_provider_profile_maps_unknown_to_custom() {
         assert_eq!(
-            telemetry_provider_profile("CLAUDE"),
+            telemetry_provider_profile("CLAUDE-CODE"),
             TelemetryProviderProfile::Claude
+        );
+        // A legacy alias is not a profile ID, so it buckets as custom.
+        assert_eq!(
+            telemetry_provider_profile("claude"),
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("github"),
             TelemetryProviderProfile::Github
         );
+        // Legacy aliases are not profile IDs.
         assert_eq!(
             telemetry_provider_profile("gh"),
-            TelemetryProviderProfile::Github
+            TelemetryProviderProfile::Custom
         );
         assert_eq!(
             telemetry_provider_profile("glab"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("gitlab"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("opencode"),
             TelemetryProviderProfile::Custom
         );
         assert_eq!(
@@ -10022,7 +10028,7 @@ mod tests {
                 workspace: "default".to_string(),
                 deletion_time: None,
             }),
-            r#type: "claude".to_string(),
+            r#type: "claude-code".to_string(),
             credentials: [
                 ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
                 ("CLAUDE_API_KEY".to_string(), "sk-abc".to_string()),
@@ -13331,7 +13337,11 @@ mod tests {
         use openshell_core::google_cloud;
         let provider = google_cloud_provider(HashMap::new());
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert_eq!(
             env.get("GCE_METADATA_HOST").map(String::as_str),
             Some(google_cloud::METADATA_HOST),
@@ -13350,7 +13360,11 @@ mod tests {
             "my-project".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::PROJECT_ID_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13368,7 +13382,11 @@ mod tests {
             "us-central1".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::REGION_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13386,7 +13404,11 @@ mod tests {
             "sa@proj.iam.gserviceaccount.com".to_string(),
         )]));
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         for var in google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
             assert_eq!(
                 env.get(*var).map(String::as_str),
@@ -13403,7 +13425,11 @@ mod tests {
             "from-config".to_string(),
         )]));
         let mut env = HashMap::from([("GCP_PROJECT_ID".to_string(), "user-override".to_string())]);
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert_eq!(
             env.get("GCP_PROJECT_ID").map(String::as_str),
             Some("user-override"),
@@ -13432,7 +13458,11 @@ mod tests {
             credential_handles: HashMap::new(),
         };
         let mut env = HashMap::new();
-        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        openshell_providers::ProviderRegistry::new().inject_env_for_profile_id(
+            &provider,
+            &provider.r#type,
+            &mut env,
+        );
         assert!(
             env.is_empty(),
             "non-GCP provider should not inject any env vars"
