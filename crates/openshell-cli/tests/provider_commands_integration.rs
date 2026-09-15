@@ -423,7 +423,7 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         if provider.credentials.is_empty() && provider.credential_handles.is_empty() {
-            let bootstrap_allowed = if let Some(profile) = openshell_providers::builtin_profiles()
+            let bootstrap_allowed = if let Some(profile) = helpers::example_profiles()
                 .iter()
                 .find(|p| p.id.eq_ignore_ascii_case(&provider.r#type))
             {
@@ -502,7 +502,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let mut profiles = openshell_providers::builtin_profiles()
+        let mut profiles = helpers::example_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
@@ -530,7 +530,7 @@ impl OpenShell for TestOpenShell {
             .cloned();
         let profile = if let Some(profile) = scoped_profile {
             profile
-        } else if let Some(profile) = openshell_providers::builtin_profiles()
+        } else if let Some(profile) = helpers::example_profiles()
             .iter()
             .find(|profile| profile.id == id)
         {
